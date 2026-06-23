@@ -1,0 +1,235 @@
+"""
+Hotel Revenue Analysis — ARBSB Property
+Four-year PMS data analysis (2023–2026 YTD)
+
+Extracts key metrics from Opera/PMS export files:
+  - Manager Reports (occupancy, ADR, RevPAR, revenue)
+  - Market Code Statistics (segment mix, ADR by segment)
+  - Stats by Length of Stay (LOS buckets, extended stay)
+
+Author: Night Audit → Revenue Analyst
+"""
+
+import csv
+import json
+from pathlib import Path
+
+
+# ── Data extraction ──────────────────────────────────────────────────────────
+
+def extract_manager_report(filepath):
+    """
+    Parse a Manager Report PMS export.
+    Returns dict of {metric_period: value} for all numeric fields.
+    """
+    data = {}
+    with open(filepath, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            metric = (row.get('DESCRIPTION') or '').strip()
+            period = (row.get('HEADING_2') or '').strip()
+            val    = (row.get('SUM_AMOUNT') or '').strip()
+            if metric and period and val:
+                try:
+                    data[f"{metric}|{period}"] = float(val)
+                except ValueError:
+                    pass
+    return data
+
+
+def extract_market_codes(filepath):
+    """
+    Parse a Market Code Statistics PMS export.
+    Returns dict of {segment_code: {desc, rooms_ytd, revenue_ytd, adr_ytd}}.
+    """
+    segments = {}
+    with open(filepath, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            code = (row.get('GRP_SORT_ORDER') or '').strip()
+            desc = (row.get('MARKET_GROUP_DESCRIPTION') or '').strip()
+            if code and desc and len(code) == 1 and code.isalpha():
+                segments[code] = {
+                    'description': desc,
+                    'rooms_ytd':   float(row.get('PM_YEAR_ROOM') or 0),
+                    'revenue_ytd': float(row.get('PM_YEAR_CREV') or 0),
+                    'adr_ytd':     float(row.get('PM_YEAR_ARR')  or 0),
+                }
+    return segments
+
+
+def extract_los(filepath):
+    """
+    Parse a Stats by Length of Stay PMS export.
+    Returns dict with LOS bucket room counts and ADR by bucket (YTD).
+    """
+    result = {}
+    with open(filepath, newline='', encoding='utf-8-sig') as f:
+        content = f.read()
+
+    lines = content.strip().split('\n')
+
+    # Extended stay block
+    for i, line in enumerate(lines):
+        if line.startswith('EXT_STAY_ROOM_REVENUE_YTD'):
+            headers = line.split(',')
+            values  = lines[i + 1].split(',')
+            d = dict(zip(headers, values))
+            result['ext_stay_rooms_ytd']   = float(d.get('EXT_STAY_ROOMS_YTD', 0))
+            result['ext_stay_revenue_ytd'] = float(d.get('EXT_STAY_ROOM_REVENUE_YTD', 0))
+            result['ext_stay_adr_ytd']     = float(d.get('CF_EXT_STAY_ADR_YTD', 0))
+            break
+
+    # LOS bucket breakdown
+    for i, line in enumerate(lines):
+        if 'CS_PHYSICAL_MINUS_OO_REP' in line:
+            headers = line.split(',')
+            values  = lines[i + 1].split(',')
+            d = dict(zip(headers, values))
+            for bucket, key_r, key_a in [
+                ('1_6',   'CS_ROOMS1_YTD_REP', 'CF_ADR1_YTD_REP'),
+                ('7_14',  'CS_ROOMS2_YTD_REP', 'CF_ADR2_YTD_REP'),
+                ('15_29', 'CS_ROOMS3_YTD_REP', 'CF_ADR3_YTD_REP'),
+                ('30_plus','CS_ROOMS4_YTD_REP','CF_ADR4_YTD_REP'),
+            ]:
+                try:
+                    result[f'rooms_{bucket}'] = float(d.get(key_r, 0))
+                    result[f'adr_{bucket}']   = float(d.get(key_a, 0))
+                except ValueError:
+                    pass
+            break
+
+    return result
+
+
+# ── Compile all years ────────────────────────────────────────────────────────
+
+def compile_all_years(data_dir='.'):
+    data_dir = Path(data_dir)
+    years    = [2023, 2024, 2025, 2026]
+    compiled = {}
+
+    for year in years:
+        mgr     = extract_manager_report(data_dir / f'manager_report{year}.txt')
+        mkt     = extract_market_codes(data_dir / f'market_code_statistics_{year}.txt')
+        los     = extract_los(data_dir / f'stats_by_length_of_stay_{year}.txt')
+
+        compiled[year] = {
+            'occupancy_ytd': mgr.get('% Rooms Occupied|YEAR'),
+            'adr_ytd':       mgr.get('ADR|YEAR'),
+            'revpar_ytd':    mgr.get('Revenue per Available Room minus OOO|YEAR'),
+            'room_rev_ytd':  mgr.get('Room Revenue|YEAR'),
+            'total_rev_ytd': mgr.get('Total Revenue|YEAR'),
+            'ooo_ytd':       mgr.get('Out of Order Rooms|YEAR'),
+            'oos_ytd':       mgr.get('Out of Service Rooms|YEAR'),
+            'group_rooms':   mgr.get('Group Rooms In-House|YEAR'),
+            'segments':      mkt,
+            'los':           los,
+        }
+
+    return compiled
+
+
+# ── Summary report ───────────────────────────────────────────────────────────
+
+def print_summary(compiled):
+    years = sorted(compiled.keys())
+
+    print("\n" + "=" * 60)
+    print("ARBSB — FOUR-YEAR PERFORMANCE SUMMARY")
+    print("=" * 60)
+
+    print(f"\n{'Metric':<28} " + " ".join(f"{y:>10}" for y in years))
+    print("-" * 68)
+
+    metrics = [
+        ('Occupancy %',    'occupancy_ytd', '{:.1f}%'),
+        ('ADR',            'adr_ytd',       '${:.2f}'),
+        ('RevPAR',         'revpar_ytd',    '${:.2f}'),
+        ('Room Revenue',   'room_rev_ytd',  '${:,.0f}'),
+        ('OOO Rooms',      'ooo_ytd',       '{:.0f}'),
+        ('Group Rooms',    'group_rooms',   '{:.0f}'),
+    ]
+
+    for label, key, fmt in metrics:
+        row = f"{label:<28}"
+        for y in years:
+            val = compiled[y].get(key)
+            row += f"  {fmt.format(val):>8}" if val is not None else f"  {'N/A':>8}"
+        print(row)
+
+    print("\n\n--- MARKET SEGMENT ADR TRENDS ---\n")
+    key_segs = {
+        'Y': 'Long-Term',
+        'D': 'Discount / OTA',
+        'P': 'Corp Key Accts',
+        'G': 'Corp-Global',
+        'L': 'Corp-Negotiated',
+        'K': 'Package-Leisure',
+        'Z': 'Group',
+        'B': 'Corp-Packages',
+    }
+
+    print(f"{'Segment':<22} " + " ".join(f"{y:>10}" for y in years))
+    print("-" * 62)
+    for code, name in key_segs.items():
+        row = f"{name:<22}"
+        for y in years:
+            adr = compiled[y]['segments'].get(code, {}).get('adr_ytd', 0)
+            row += f"  {'$'+f'{adr:.2f}':>8}" if adr else f"  {'gone':>8}"
+        print(row)
+
+    print("\n\n--- LENGTH OF STAY — 30+ NIGHT SHARE ---\n")
+    print(f"{'Year':<8} {'30+ Rooms':>12} {'Total Rooms':>12} {'Share':>8} {'30+ ADR':>10}")
+    print("-" * 52)
+    for y in years:
+        los        = compiled[y]['los']
+        r30        = los.get('rooms_30_plus', 0)
+        total_rms  = sum(los.get(f'rooms_{b}', 0) for b in ['1_6','7_14','15_29','30_plus'])
+        share      = r30 / total_rms * 100 if total_rms else 0
+        adr30      = los.get('adr_30_plus', 0)
+        print(f"{y:<8} {r30:>12,.0f} {total_rms:>12,.0f} {share:>7.1f}% ${adr30:>8.2f}")
+
+    print("\n\n--- DISAPPEARED SEGMENTS (required active sales) ---\n")
+    sales_segs = ['A', 'B', 'C', 'F', 'U', 'Z']
+    print(f"{'Segment':<30} {'2023 Rooms':>12} {'2023 ADR':>10} {'2025 Rooms':>12} {'2026 Rooms':>12}")
+    print("-" * 78)
+    for code in sales_segs:
+        r23  = compiled[2023]['segments'].get(code, {})
+        r25  = compiled[2025]['segments'].get(code, {})
+        r26  = compiled[2026]['segments'].get(code, {})
+        name = r23.get('description', code)
+        print(
+            f"{name:<30} "
+            f"{r23.get('rooms_ytd', 0):>12,.0f} "
+            f"${r23.get('adr_ytd', 0):>9.2f} "
+            f"{r25.get('rooms_ytd', 0) if r25 else 'gone':>12} "
+            f"{r26.get('rooms_ytd', 0) if r26 else 'gone':>12}"
+        )
+
+    # Revenue gap calculation
+    disappeared_rev_2023 = sum(
+        compiled[2023]['segments'].get(code, {}).get('revenue_ytd', 0)
+        for code in ['A', 'B', 'C', 'F', 'U']
+    )
+    group_decline = (
+        compiled[2023]['segments'].get('Z', {}).get('revenue_ytd', 0) -
+        compiled[2026]['segments'].get('Z', {}).get('revenue_ytd', 0)
+    )
+    print(f"\n  Revenue from disappeared segments (2023):  ${disappeared_rev_2023:>10,.0f}")
+    print(f"  Group segment revenue decline (2023→2026): ${group_decline:>10,.0f}")
+    print(f"  Estimated annual premium revenue gap:      ${disappeared_rev_2023 + group_decline:>10,.0f}")
+    print(f"\n  Salesperson break-even (30% recovery):     ${(disappeared_rev_2023 + group_decline) * 0.30:>10,.0f}")
+    print(f"  Loaded salesperson cost estimate:          ${'65,000':>10}")
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    compiled = compile_all_years(data_dir='.')
+    print_summary(compiled)
+
+    # Optionally dump to JSON for use in other tools
+    with open('compiled_data.json', 'w') as f:
+        json.dump(compiled, f, indent=2, default=str)
+    print("\n\nFull data exported to compiled_data.json")
